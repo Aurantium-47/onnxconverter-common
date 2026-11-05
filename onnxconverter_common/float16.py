@@ -221,6 +221,9 @@ def convert_float_to_float16(
             "The model is already converted to float16, if convert again, the model might be wrong. \n If you are sure to convert again, please set check_fp16_ready=False."
         )
 
+    if keep_io_types:
+        cast_captured_graph_inputs(model.graph, op_block_list, node_block_list)
+
     graph_stack = [model.graph]
 
     is_top_level = True
@@ -255,8 +258,6 @@ def convert_float_to_float16(
             if len(sub_graph_list) > 0:
                 next_level.extend(sub_graph_list)
 
-            if not is_top_level:
-                process_node_input_output(curr_graph, global_input_name_dict)
             is_top_level = False  # Going to process sub-graph
         graph_stack = next_level
 
@@ -266,18 +267,118 @@ def convert_float_to_float16(
     return model
 
 
-# Change the input/output of the node to the new output name after Cast node for sub-graph
-# Because there have NO value_info start from
-def process_node_input_output(
-    graph: onnx_proto.GraphProto, global_input_name_dict: dict
-):
+def cast_captured_graph_inputs(graph, op_block_list, node_block_list):
+    """Cast retained root inputs where converted subgraphs capture them.
+
+    A graph attribute can use an enclosing value without listing it as a node
+    input. Keep the cast in the consuming graph, so blocked graph attributes
+    still capture the original float32 value and no implicit parent dependency
+    is introduced. Local definitions shadow enclosing names.
+    """
+
+    def subgraphs(node):
+        for attr in node.attribute:
+            if attr.type == onnx_proto.AttributeProto.GRAPH:
+                yield attr.g
+            elif attr.type == onnx_proto.AttributeProto.GRAPHS:
+                yield from attr.graphs
+
+    def definitions(current):
+        return (
+            {value.name for value in current.input}
+            | {value.name for value in current.initializer}
+            | {value.values.name for value in current.sparse_initializer}
+            | {name for node in current.node for name in node.output if name}
+        )
+
+    # Names must not collide with definitions or free references in any scope.
+    used_names = set()
+    pending = [graph]
+    while pending:
+        current = pending.pop()
+        used_names.update(definitions(current))
+        used_names.update(value.name for value in current.output)
+        used_names.update(value.name for value in current.value_info)
+        for node in current.node:
+            used_names.add(node.name)
+            used_names.update(node.input)
+            pending.extend(subgraphs(node))
+
+    def fresh_name(stem):
+        name = stem
+        suffix = 0
+        while name in used_names:
+            suffix += 1
+            name = stem + "_" + str(suffix)
+        used_names.add(name)
+        return name
+
+    def rename_local(current, old, new, defining_graph=True):
+        if not defining_graph and old in definitions(current):
+            return
+        values = list(current.output) + list(current.value_info)
+        if defining_graph:
+            values += list(current.input) + list(current.initializer)
+            values += [value.values for value in current.sparse_initializer]
+        for value in values:
+            if value.name == old:
+                value.name = new
+        for node in current.node:
+            for i, name in enumerate(node.input):
+                if name == old:
+                    node.input[i] = new
+            if defining_graph:
+                for i, name in enumerate(node.output):
+                    if name == old:
+                        node.output[i] = new
+            for child in subgraphs(node):
+                rename_local(child, old, new, defining_graph=False)
+
+    def visit(current, enclosing_inputs):
+        local_names = definitions(current)
+        captured_inputs = {
+            name: value
+            for name, value in enclosing_inputs.items()
+            if name not in local_names
+        }
+        # Keep distinct bindings distinct after conversion, even in runtimes
+        # that compare types of same-named outer and local initializers.
+        for name in sorted(local_names & root_inputs.keys()):
+            rename_local(current, name, fresh_name(name + "_local"))
+        replacements = {}
+
+        def cast(name):
+            if name not in replacements:
+                new_name = fresh_name(name + "_capture_cast")
+                add_cast_node(current, [name], [new_name], new_name, FLOAT16)
+                add_new_value_info(current, captured_inputs[name], new_name, FLOAT16)
+                replacements[name] = new_name
+            return replacements[name]
+
+        # Snapshot the nodes so the newly added Cast inputs are not rewritten.
+        for node in list(current.node):
+            if node.op_type in op_block_list or node.name in node_block_list:
+                continue
+            for i, name in enumerate(node.input):
+                if name in captured_inputs:
+                    node.input[i] = cast(name)
+            for child in subgraphs(node):
+                visit(child, captured_inputs)
+        # These annotations describe the retained enclosing float32 value, not
+        # a local value to convert. Its type remains available in the root.
+        for value in list(current.value_info):
+            if value.name in captured_inputs:
+                current.value_info.remove(value)
+
+    root_inputs = {
+        value.name: value
+        for value in graph.input
+        if value.type.tensor_type.elem_type == FLOAT32
+    }
     for node in graph.node:
-        for i, input_name in enumerate(node.input):
-            if input_name in global_input_name_dict:
-                node.input[i] = global_input_name_dict[input_name]
-        for i, output_name in enumerate(node.output):
-            if output_name in global_input_name_dict:
-                node.output[i] = global_input_name_dict[output_name]
+        if node.op_type not in op_block_list and node.name not in node_block_list:
+            for child in subgraphs(node):
+                visit(child, root_inputs)
 
 
 def process_graph_input(
